@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 const axios = require('axios');
 
-// Funkcja do pobierania i porównywania cen przedmiotu w wybranych miastach z uwzględnieniem jakości
+// function for downloading and comparing prices of item and quality in selected cities
 async function compareItemPrices(itemId, city1, city2, quality = 1) {
   const url = `https://www.albion-online-data.com/api/v2/stats/prices/${itemId}.json`;
 
@@ -9,39 +9,39 @@ async function compareItemPrices(itemId, city1, city2, quality = 1) {
     const response = await axios.get(url);
     const data = response.data;
 
-    // Filtrowanie danych według jakości
+    // filter by item quality
     const filteredData = data.filter(item => item.quality === quality);
 
-    // Filtrujemy dane dla dwóch wybranych miast
+    // filter for 2 cities
     const priceCity1 = filteredData.find(item => item.city === city1);
     const priceCity2 = filteredData.find(item => item.city === city2);
 
     if (!priceCity1 || !priceCity2) {
-      console.log("Nie znaleziono cen dla jednego z miast lub przedmiotu o podanej jakości.");
+      console.log("No prices were found for one of the cities or an item of the specified quality.");
       return;
     }
 
-    // Wyświetlamy porównanie
-    console.log(`Ceny dla przedmiotu ${itemId} (Quality ${quality}):`);
-    console.log(`${city1}: Najniższa cena sprzedaży: ${priceCity1.sell_price_min || 'Brak danych'}`);
-    console.log(`${city2}: Najniższa cena sprzedaży: ${priceCity2.sell_price_min || 'Brak danych'}`);
+    // comparison
+    console.log(`Price for ${itemId} (Quality ${quality}):`);
+    console.log(`${city1}: Lowest price sprzedaży: ${priceCity1.sell_price_min || 'No data'}`);
+    console.log(`${city2}: Lowest price sprzedaży: ${priceCity2.sell_price_min || 'No data'}`);
 
-    // Porównanie różnic w cenie
+    // price difference
     if (priceCity1.sell_price_min && priceCity2.sell_price_min) {
       const difference = priceCity1.sell_price_min - priceCity2.sell_price_min;
-      console.log(`Różnica w cenie: ${difference > 0 ? '+' : ''}${difference} srebra`);
+      console.log(`Price difference: ${difference > 0 ? '+' : ''}${difference} silver`);
     }
   } catch (error) {
-    console.error("Błąd podczas pobierania danych:", error.message);
+    console.error("Error:", error.message);
   }
 }
 
-// Pobieramy argumenty z terminala
+// arguments from terminal
 const args = process.argv.slice(2);
 const [itemId, city1, city2, quality] = args;
 
 if (!itemId || !city1 || !city2) {
-  console.log("Użycie: albion-prices <itemId> <city1> <city2> [quality]");
+  console.log("Usage: albion-prices <itemId> <city1> <city2> [quality]");
 } else {
   compareItemPrices(itemId, city1, city2, parseInt(quality) || 1);
 }
