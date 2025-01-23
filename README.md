@@ -25,7 +25,6 @@ A terminal-based tool to compare item prices between cities in Albion Online usi
    albion-prices T4_BAG Thetford Caerleon 2
 
 ## Notes
-a. Replace <item_id> with the desired item's ID
-b. Replace <city1> and <city2> with the names of the cities you want to compare
-c. [quality] is optional (from 1 low to 5 excellent) and default set to 1 if not provided
-   
+1. Replace <item_id> with the desired item's ID
+2. Replace <city1> and <city2> with the names of the cities you want to compare
+3. [quality] is optional (from 1 low to 5 excellent) and default set to 1 if not provided
