@@ -1,5 +1,22 @@
 #!/usr/bin/env node
 const axios = require('axios');
+const Fuse = require('fuse.js'); // fuzzy search
+const items = require('./items.json'); // import json list
+
+// fuse.js config
+const fuse = new Fuse(items, {
+  includeScore: true,
+  threshold: 0.3
+});
+
+// funcs for best match
+function findBestMatch(input) {
+  const results = fuse.search(input);
+  if (results.length > 0) {
+    return results[0].item; // best match
+  }
+  return null;
+}
 
 // function for downloading and comparing prices of item and quality in selected cities
 async function compareItemPrices(itemId, city1, city2, quality = 1) {
