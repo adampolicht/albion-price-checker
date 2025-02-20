@@ -40,8 +40,11 @@ async function compareItemPrices(itemId, city1, city2, quality = 1) {
 const args = process.argv.slice(2);
 const [itemId, city1, city2, quality] = args;
 
+// item has tier or not
+const hasTier = /^T\d+_/.test(itemId);
+
 if (!itemId || !city1 || !city2) {
   console.log("Usage: albion-prices <itemId> <city1> <city2> [quality]");
 } else {
-  compareItemPrices(itemId, city1, city2, parseInt(quality) || 1);
+  compareItemPrices(itemId, city1, city2, hasTier ? parseInt(quality) || 1 : 1);
 }
