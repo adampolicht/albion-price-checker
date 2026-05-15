@@ -7,10 +7,10 @@ const chalk = require('chalk');
 const fs    = require('fs');
 const path  = require('path');
 
-const CACHE_FILE   = path.join(__dirname, 'items-cache.json');
-const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-const ITEMS_URL    = 'https://raw.githubusercontent.com/broderickhyman/ao-bin-dumps/master/formatted/items.json';
-const API_BASE     = 'https://west.albion-online-data.com/api/v2/stats/prices';
+const CACHE_FILE      = path.join(__dirname, 'items-cache.json');
+const CACHE_TTL_MS    = 7 * 24 * 60 * 60 * 1000;
+const ITEMS_URL       = 'https://raw.githubusercontent.com/broderickhyman/ao-bin-dumps/master/formatted/items.json';
+const API_BASE        = 'https://west.albion-online-data.com/api/v2/stats/prices';
 
 const CITIES = [
   'Caerleon', 'Bridgewatch', 'Lymhurst', 'Martlock',
@@ -18,21 +18,29 @@ const CITIES = [
 ];
 
 const QUALITY_NAMES = { 1: 'Normal', 2: 'Good', 3: 'Outstanding', 4: 'Excellent', 5: 'Masterpiece' };
+const ENCHANT_LEVELS  = [0, 1, 2, 3, 4];
+const BATCH_SIZE      = 80;   // items per API request
+
+// Staleness thresholds (minutes)
+const STALE_WARN_MIN  = 45;   // yellow warning
+const STALE_OLD_MIN   = 180;  // red — likely gone
 
 // ─── Tax ─────────────────────────────────────────────────────────────────────
-// Setup fee 2.5% on both buy and sell orders.
-// Transaction tax: 8% non-premium, 4% premium.
-// Net receive: sell * (1 - 0.025 - tax). Net cost: buy * 1.025.
-// Non-premium break-even: ~14.5% spread. Premium: ~9.6%.
+// Setup 2.5% both sides + transaction tax 8% (non-premium) / 4% (premium)
+// Net receive: sell × 0.895 | 0.935. Net cost: buy × 1.025.
 function calcProfit(buyPrice, sellPrice, premium) {
   if (!buyPrice || !sellPrice || buyPrice <= 0 || sellPrice <= 0) return null;
-  const netSell = premium ? sellPrice * 0.935 : sellPrice * 0.895;
-  return netSell - buyPrice * 1.025;
+  return (premium ? sellPrice * 0.935 : sellPrice * 0.895) - buyPrice * 1.025;
 }
 
 function calcProfitPct(buyPrice, p) {
   if (p === null || !buyPrice) return null;
   return (p / (buyPrice * 1.025)) * 100;
+}
+
+// ─── Enchantment helpers ──────────────────────────────────────────────────────
+function enchantId(baseId, level) {
+  return level === 0 ? baseId : `${baseId}@${level}`;
 }
 
 // ─── Items cache ──────────────────────────────────────────────────────────────
@@ -64,20 +72,67 @@ function findItem(items, query) {
     includeScore: true,
     threshold: 0.4,
   });
-
-  const results = fuse.search(query);
-
-  // Re-rank: items containing ALL query words score highest, then Fuse score
   const words = query.toLowerCase().split(/\s+/);
-  const ranked = results
+  return fuse.search(query)
     .map(r => {
       const nameLower = r.item.name.toLowerCase();
-      const wordHits  = words.filter(w => nameLower.includes(w)).length;
-      return { item: r.item, fuseScore: r.score, wordHits };
+      const hits = words.filter(w => nameLower.includes(w)).length;
+      return { item: r.item, score: r.score, hits };
     })
-    .sort((a, b) => b.wordHits - a.wordHits || a.fuseScore - b.fuseScore);
+    .sort((a, b) => b.hits - a.hits || a.score - b.score)
+    .slice(0, 5)
+    .map(r => r.item);
+}
 
-  return ranked.slice(0, 5).map(r => r.item);
+// ─── API ──────────────────────────────────────────────────────────────────────
+async function fetchPrices(itemIds, quality) {
+  const all = [];
+  for (let i = 0; i < itemIds.length; i += BATCH_SIZE) {
+    const batch = itemIds.slice(i, i + BATCH_SIZE);
+    const url   = `${API_BASE}/${batch.join(',')}.json?locations=${encodeURIComponent(CITIES.join(','))}&qualities=${quality}`;
+    const res   = await axios.get(url, { timeout: 15000 });
+    all.push(...res.data);
+  }
+  return all;
+}
+
+function buildCityMap(data, itemId, quality) {
+  const map = {};
+  for (const e of data) {
+    if (e.item_id?.toUpperCase() !== itemId.toUpperCase()) continue;
+    if (e.quality !== quality) continue;
+    map[e.city] = {
+      sell:     e.sell_price_min       || 0,
+      buy:      e.buy_price_max        || 0,
+      sellDate: e.sell_price_min_date,
+      buyDate:  e.buy_price_max_date,
+    };
+  }
+  return map;
+}
+
+function bestArbitrage(cityMap, premium) {
+  const withSell = CITIES.filter(c => cityMap[c]?.sell > 0);
+  const withBuy  = CITIES.filter(c => cityMap[c]?.buy  > 0);
+
+  let best = null;
+  for (const buyCity of withSell) {
+    for (const sellCity of withBuy) {
+      if (buyCity === sellCity) continue;
+      const buyPrice  = cityMap[buyCity].sell;
+      const sellPrice = cityMap[sellCity].buy;
+      const p   = calcProfit(buyPrice, sellPrice, premium);
+      const pct = calcProfitPct(buyPrice, p);
+      if (best === null || (p !== null && p > (best.profit ?? -Infinity))) {
+        best = {
+          buyCity, sellCity, buyPrice, sellPrice, profit: p, profitPct: pct,
+          buyAge:  cityMap[buyCity].sellDate,
+          sellAge: cityMap[sellCity].buyDate,
+        };
+      }
+    }
+  }
+  return best;
 }
 
 // ─── Formatting ───────────────────────────────────────────────────────────────
@@ -90,138 +145,290 @@ function fmtSilver(n, width = 9) {
   return s.padStart(width);
 }
 
-function fmtAge(dateStr, width = 8) {
-  if (!dateStr || dateStr.startsWith('0001')) return chalk.dim('never'.padEnd(width));
-  const h = Math.floor((Date.now() - new Date(dateStr)) / 3_600_000);
-  let s;
-  if (h < 1)  s = '< 1h';
-  else if (h < 24) s = `${h}h ago`;
-  else         s = `${Math.floor(h / 24)}d ago`;
-  const padded = s.padEnd(width);
-  if (h < 2)  return chalk.green(padded);
-  if (h < 24) return chalk.yellow(padded);
-  return chalk.red(padded);
+function ageMinutes(dateStr) {
+  if (!dateStr || dateStr.startsWith('0001')) return Infinity;
+  return (Date.now() - new Date(dateStr)) / 60000;
 }
 
-// ─── Price table ──────────────────────────────────────────────────────────────
-function printTable(item, quality, data, premium) {
-  const cityMap = {};
-  for (const entry of data) {
-    if (entry.quality !== quality) continue;
-    cityMap[entry.city] = {
-      sell:        entry.sell_price_min      || 0,
-      buy:         entry.buy_price_max       || 0,
-      sellDate:    entry.sell_price_min_date,
-      buyDate:     entry.buy_price_max_date,
-    };
-  }
+function fmtAge(dateStr) {
+  const mins = ageMinutes(dateStr);
+  if (mins === Infinity) return chalk.dim('never   ');
+  let s;
+  if (mins < 60) s = `${Math.round(mins)}min`;
+  else if (mins < 24 * 60) s = `${Math.floor(mins / 60)}h ago`;
+  else s = `${Math.floor(mins / 1440)}d ago`;
+  s = s.padEnd(8);
+  if (mins < STALE_WARN_MIN) return chalk.green(s);
+  if (mins < STALE_OLD_MIN)  return chalk.yellow(s);
+  return chalk.red(s);
+}
 
-  const citiesWithSell = CITIES.filter(c => cityMap[c]?.sell > 0);
-  const citiesWithBuy  = CITIES.filter(c => cityMap[c]?.buy  > 0);
+function staleFlag(dateStr) {
+  const mins = ageMinutes(dateStr);
+  if (mins > STALE_OLD_MIN) return chalk.red(' ⚠ STALE');
+  if (mins > STALE_WARN_MIN) return chalk.yellow(' ⚠');
+  return '';
+}
 
-  const bestBuyCity  = citiesWithSell.length
-    ? citiesWithSell.reduce((a, b) => cityMap[a].sell < cityMap[b].sell ? a : b)
-    : null;
-  const bestSellCity = citiesWithBuy.length
-    ? citiesWithBuy.reduce((a, b) => cityMap[a].buy > cityMap[b].buy ? a : b)
-    : null;
-
-  const W   = 84;
+// ─── Single-item view ─────────────────────────────────────────────────────────
+function printTable(item, quality, data, premium, enchantFilter) {
+  const W   = 86;
   const bar = '═'.repeat(W);
   const sep = '─'.repeat(W);
-
   const qualLabel = QUALITY_NAMES[quality] || `Q${quality}`;
+
+  const levels = enchantFilter !== null ? [enchantFilter] : ENCHANT_LEVELS;
+
   console.log('\n' + chalk.cyan(bar));
   console.log(chalk.bold(`  ${item.name}  ·  ${item.id}  ·  ${qualLabel}`));
   console.log(chalk.cyan(bar));
-  console.log(
-    chalk.bold(
-      '  ' + 'City'.padEnd(16) +
-      'Sell (min)'.padStart(10) + '  ' + 'Updated'.padEnd(9) +
-      'Buy (max)'.padStart(10) + '  ' + 'Updated'.padEnd(9) +
-      'Arbitrage'
-    )
-  );
-  console.log(chalk.dim('  ' + sep));
 
-  for (const city of CITIES) {
-    const d = cityMap[city] || {};
-    const isBestBuy  = city === bestBuyCity;
-    const isBestSell = city === bestSellCity;
+  // Compact enchant summary table (when showing multiple enchants)
+  if (levels.length > 1) {
+    console.log(chalk.bold('  ' + 'Enchant'.padEnd(10) + 'Best Buy'.padEnd(16) + 'Buy Price'.padStart(10) +
+      '  ' + 'Best Sell'.padEnd(16) + 'Sell Price'.padStart(11) + '  Profit'));
+    console.log(chalk.dim('  ' + sep));
 
-    const sellRaw = fmtSilver(d.sell);
-    const buyRaw  = fmtSilver(d.buy);
+    let anyData = false;
+    for (const lvl of levels) {
+      const id      = enchantId(item.id, lvl);
+      const cityMap = buildCityMap(data, id, quality);
+      const arb     = bestArbitrage(cityMap, premium);
+      const label   = lvl === 0 ? '  base  ' : `  .${lvl}     `;
 
-    const sellStr = d.sell > 0
-      ? (isBestBuy  ? chalk.green(sellRaw) : sellRaw)
-      : chalk.dim(sellRaw);
-    const buyStr  = d.buy > 0
-      ? (isBestSell ? chalk.green(buyRaw)  : buyRaw)
-      : chalk.dim(buyRaw);
+      if (!arb || arb.profit === null) {
+        console.log(`  ${chalk.dim(label)}` + chalk.dim('  no data'));
+        continue;
+      }
+      anyData = true;
 
-    const tags = [];
-    if (isBestBuy)  tags.push(chalk.green('← buy here'));
-    if (isBestSell) tags.push(chalk.green('← sell here'));
+      const profitStr = arb.profit >= 0
+        ? chalk.green(`+${fmtSilver(Math.round(arb.profit)).trim()} (${arb.profitPct?.toFixed(0)}%)`)
+        : chalk.red(`${fmtSilver(Math.round(arb.profit)).trim()} (${arb.profitPct?.toFixed(0)}%)`);
 
-    console.log(
-      '  ' + city.padEnd(16) +
-      sellStr + '  ' + fmtAge(d.sellDate) + '  ' +
-      buyStr  + '  ' + fmtAge(d.buyDate)  + '  ' +
-      tags.join('  ')
-    );
+      const buyStale  = staleFlag(arb.buyAge);
+      const sellStale = staleFlag(arb.sellAge);
+
+      console.log(
+        `  ${chalk.cyan(label)}` +
+        arb.buyCity.padEnd(16) + fmtSilver(arb.buyPrice).padStart(10) + buyStale.padEnd(4) +
+        '  ' + arb.sellCity.padEnd(16) + fmtSilver(arb.sellPrice).padStart(10) + sellStale.padEnd(4) +
+        '  ' + profitStr
+      );
+    }
+
+    if (!anyData) {
+      console.log(chalk.dim('  No price data found across any enchantment level.'));
+    }
+    console.log(chalk.dim('  ' + sep));
+    console.log(chalk.dim(`  Tax: ${premium ? 'premium 4%' : 'non-premium 8%'}  ·  Use --enchant N for full city breakdown  ·  ` +
+      `${chalk.yellow('⚠')} = data ${STALE_WARN_MIN}+ min old  ·  ${chalk.red('⚠ STALE')} = ${STALE_OLD_MIN}+ min`));
   }
 
-  console.log(chalk.dim('  ' + sep));
+  // Full city table (when a single enchant is selected)
+  if (levels.length === 1) {
+    const lvl     = levels[0];
+    const id      = enchantId(item.id, lvl);
+    const cityMap = buildCityMap(data, id, quality);
 
-  // ─── Arbitrage summary ───────────────────────────────────────────────────
-  if (bestBuyCity && bestSellCity && bestBuyCity !== bestSellCity) {
-    const buyPrice  = cityMap[bestBuyCity].sell;
-    const sellPrice = cityMap[bestSellCity].buy;
-    const p   = calcProfit(buyPrice, sellPrice, premium);
-    const pct = calcProfitPct(buyPrice, p);
+    const withSell = CITIES.filter(c => cityMap[c]?.sell > 0);
+    const withBuy  = CITIES.filter(c => cityMap[c]?.buy  > 0);
+    const bestBuyCity  = withSell.length ? withSell.reduce((a, b) => cityMap[a].sell < cityMap[b].sell ? a : b) : null;
+    const bestSellCity = withBuy.length  ? withBuy.reduce((a, b) => cityMap[a].buy > cityMap[b].buy ? a : b)   : null;
 
-    const profitStr = p !== null
-      ? (p >= 0 ? chalk.green(`+${Math.round(p).toLocaleString()} silver`) : chalk.red(`${Math.round(p).toLocaleString()} silver`))
-      : chalk.dim('—');
-    const pctStr = pct !== null
-      ? (pct >= 0 ? chalk.green(`(+${pct.toFixed(1)}%)`) : chalk.red(`(${pct.toFixed(1)}%)`))
-      : '';
+    const enchLabel = lvl === 0 ? '' : ` .${lvl}`;
+    console.log(chalk.bold(`  Enchantment${enchLabel}`));
+    console.log(chalk.dim('  ' + sep));
+    console.log(chalk.bold('  ' + 'City'.padEnd(16) + 'Sell (min)'.padStart(10) + '  ' + 'Updated'.padEnd(10) +
+      'Buy (max)'.padStart(10) + '  ' + 'Updated'.padEnd(10) + 'Note'));
+    console.log(chalk.dim('  ' + sep));
 
-    console.log(`\n  ${chalk.bold('Best arbitrage')}  ${chalk.dim(premium ? '[premium tax 4%]' : '[non-premium tax 8%]')}`);
-    console.log(`  Buy  in ${chalk.cyan(bestBuyCity.padEnd(14))}  ${fmtSilver(buyPrice).trim()} silver`);
-    console.log(`  Sell in ${chalk.cyan(bestSellCity.padEnd(14))}  ${fmtSilver(sellPrice).trim()} silver`);
-    console.log(`  Profit: ${profitStr}  ${pctStr}`);
+    for (const city of CITIES) {
+      const d = cityMap[city] || {};
+      const isBestBuy  = city === bestBuyCity;
+      const isBestSell = city === bestSellCity;
 
-    if (p !== null && p < 0) {
-      const breakEven = Math.ceil(buyPrice * 1.025 / (premium ? 0.935 : 0.895));
-      console.log(chalk.dim(`  Break-even sell price: ${breakEven.toLocaleString()} silver`));
+      const sellRaw = fmtSilver(d.sell);
+      const buyRaw  = fmtSilver(d.buy);
+
+      const sellStr = d.sell > 0 ? (isBestBuy  ? chalk.green(sellRaw)  : sellRaw) : chalk.dim(sellRaw);
+      const buyStr  = d.buy  > 0 ? (isBestSell ? chalk.green(buyRaw)   : buyRaw)  : chalk.dim(buyRaw);
+
+      const tags = [];
+      if (isBestBuy)  tags.push(chalk.green('← buy here'));
+      if (isBestSell) tags.push(chalk.green('← sell here'));
+
+      console.log('  ' + city.padEnd(16) +
+        sellStr + '  ' + fmtAge(d.sellDate) + '  ' +
+        buyStr  + '  ' + fmtAge(d.buyDate)  + '  ' +
+        tags.join('  '));
     }
-  } else if (!bestBuyCity || !bestSellCity) {
-    console.log(chalk.dim('\n  Insufficient price data for arbitrage calculation.'));
-  } else {
-    console.log(chalk.dim(`\n  Best buy and sell are both in ${bestBuyCity} — no cross-city arbitrage.`));
+
+    console.log(chalk.dim('  ' + sep));
+
+    const arb = bestArbitrage(cityMap, premium);
+    if (arb && arb.buyCity !== arb.sellCity) {
+      const profitStr = arb.profit !== null
+        ? (arb.profit >= 0 ? chalk.green(`+${Math.round(arb.profit).toLocaleString()} (${arb.profitPct?.toFixed(1)}%)`)
+                           : chalk.red(`${Math.round(arb.profit).toLocaleString()} (${arb.profitPct?.toFixed(1)}%)`))
+        : chalk.dim('—');
+
+      console.log(`\n  ${chalk.bold('Best arbitrage')}  ${chalk.dim(premium ? '[premium 4%]' : '[non-premium 8%]')}`);
+      console.log(`  Buy  ${chalk.cyan(arb.buyCity.padEnd(14))}  ${fmtSilver(arb.buyPrice).trim()}${staleFlag(arb.buyAge)}`);
+      console.log(`  Sell ${chalk.cyan(arb.sellCity.padEnd(14))}  ${fmtSilver(arb.sellPrice).trim()}${staleFlag(arb.sellAge)}`);
+      console.log(`  Profit: ${profitStr}`);
+
+      if (arb.profit !== null && arb.profit < 0) {
+        const be = Math.ceil(arb.buyPrice * 1.025 / (premium ? 0.935 : 0.895));
+        console.log(chalk.dim(`  Break-even sell price: ${be.toLocaleString()}`));
+      }
+    } else {
+      console.log(chalk.dim('\n  No arbitrage opportunity found.'));
+    }
   }
 
   console.log('\n' + chalk.cyan(bar) + '\n');
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Scan mode ────────────────────────────────────────────────────────────────
+async function runScan(items, pattern, tierArg, quality, limit, premium) {
+  const W   = 92;
+  const bar = '═'.repeat(W);
+  const sep = '─'.repeat(W);
+
+  // Filter items by name/id pattern and optional tier
+  const tierPrefix = tierArg ? `T${tierArg}_` : null;
+  const patWords   = pattern.toLowerCase().split(/\s+/);
+
+  const matched = items.filter(item => {
+    if (item.id.includes('@')) return false;  // skip enchanted variants — we generate them ourselves
+    if (tierPrefix && !item.id.toUpperCase().startsWith(tierPrefix)) return false;
+    const nameLower = item.name.toLowerCase();
+    const idLower   = item.id.toLowerCase();
+    return patWords.every(w => nameLower.includes(w) || idLower.includes(w));
+  });
+
+  if (!matched.length) {
+    console.log(chalk.red(`\nNo items found matching "${pattern}"${tierArg ? ` tier ${tierArg}` : ''}.\n`));
+    return;
+  }
+
+  // Build full list of IDs (base + enchants)
+  const allIds = matched.flatMap(item =>
+    ENCHANT_LEVELS.map(lvl => enchantId(item.id, lvl))
+  );
+
+  const tierLabel = tierArg ? ` · Tier ${tierArg}` : '';
+  const qualLabel = QUALITY_NAMES[quality] || `Q${quality}`;
+  console.log('\n' + chalk.cyan(bar));
+  console.log(chalk.bold(`  SCAN  ·  "${pattern}"${tierLabel}  ·  ${qualLabel}  ·  ${matched.length} item type(s)`));
+  console.log(chalk.dim(`  Fetching prices for ${allIds.length} item variants...`));
+  console.log(chalk.cyan(bar));
+
+  let data;
+  try {
+    data = await fetchPrices(allIds, quality);
+  } catch (err) {
+    console.error(chalk.red('API error:'), err.message);
+    return;
+  }
+
+  // Calculate best arbitrage per item+enchant
+  const rows = [];
+  for (const item of matched) {
+    for (const lvl of ENCHANT_LEVELS) {
+      const id      = enchantId(item.id, lvl);
+      const cityMap = buildCityMap(data, id, quality);
+      const arb     = bestArbitrage(cityMap, premium);
+      if (!arb || arb.profit === null) continue;
+      rows.push({ item, lvl, arb });
+    }
+  }
+
+  if (!rows.length) {
+    console.log(chalk.dim('  No price data found.\n'));
+    return;
+  }
+
+  // Sort by profit margin descending
+  rows.sort((a, b) => (b.arb.profitPct ?? -Infinity) - (a.arb.profitPct ?? -Infinity));
+  const display = rows.slice(0, limit);
+
+  console.log(chalk.bold(
+    '  ' + 'Item'.padEnd(26) + 'Ench'.padEnd(6) +
+    'Buy City'.padEnd(14) + 'Buy Price'.padStart(10) +
+    '  ' + 'Sell City'.padEnd(14) + 'Sell Price'.padStart(11) +
+    '  Profit   Margin   Freshness'
+  ));
+  console.log(chalk.dim('  ' + sep));
+
+  for (const { item, lvl, arb } of display) {
+    const enchLabel   = lvl === 0 ? 'base' : `.${lvl}  `;
+    const profitStr   = arb.profit >= 0
+      ? chalk.green(`+${fmtSilver(Math.round(arb.profit)).trim()}`)
+      : chalk.red(fmtSilver(Math.round(arb.profit)).trim());
+    const marginStr   = arb.profitPct !== null
+      ? (arb.profit >= 0 ? chalk.green(`${arb.profitPct.toFixed(0)}%`.padStart(6))
+                         : chalk.red(`${arb.profitPct.toFixed(0)}%`.padStart(6)))
+      : '     —';
+
+    const buyMins  = ageMinutes(arb.buyAge);
+    const sellMins = ageMinutes(arb.sellAge);
+    const maxMins  = Math.max(buyMins === Infinity ? 0 : buyMins, sellMins === Infinity ? 0 : sellMins);
+    let fresh;
+    if (maxMins < STALE_WARN_MIN) fresh = chalk.green('fresh');
+    else if (maxMins < STALE_OLD_MIN) fresh = chalk.yellow('aging');
+    else fresh = chalk.red('stale');
+
+    console.log(
+      '  ' + item.name.slice(0, 24).padEnd(26) +
+      enchLabel.padEnd(6) +
+      arb.buyCity.padEnd(14) +
+      fmtSilver(arb.buyPrice).padStart(10) +
+      '  ' + arb.sellCity.padEnd(14) +
+      fmtSilver(arb.sellPrice).padStart(11) +
+      '  ' + profitStr.padEnd(10) +
+      marginStr + '   ' + fresh
+    );
+  }
+
+  console.log(chalk.dim('  ' + sep));
+  if (rows.length > limit) {
+    console.log(chalk.dim(`  Showing top ${limit} of ${rows.length} results. Use --limit N to see more.`));
+  }
+  console.log(chalk.dim(`  Tax: ${premium ? 'premium 4%' : 'non-premium 8%'}`));
+  console.log('\n' + chalk.cyan(bar) + '\n');
+}
+
+// ─── CLI ──────────────────────────────────────────────────────────────────────
 async function main() {
   const argv       = process.argv.slice(2);
   const flags      = new Set(argv.filter(a => a.startsWith('--')));
   const positional = argv.filter(a => !a.startsWith('--'));
-  const [query, qualityArg] = positional;
-  const quality = Math.min(5, Math.max(1, parseInt(qualityArg) || 1));
-  const premium = flags.has('--premium');
-  const update  = flags.has('--update-cache');
 
-  if (!query && !update) {
+  const isScan     = positional[0] === 'scan';
+  const isUpdate   = flags.has('--update-cache');
+  const premium    = flags.has('--premium');
+
+  // --enchant N flag
+  let enchantFilter = null;
+  const enchantIdx = argv.findIndex(a => a === '--enchant');
+  if (enchantIdx !== -1) enchantFilter = parseInt(argv[enchantIdx + 1]) ?? null;
+
+  // --limit N flag
+  let limit = 20;
+  const limitIdx = argv.findIndex(a => a === '--limit');
+  if (limitIdx !== -1) limit = parseInt(argv[limitIdx + 1]) || 20;
+
+  if (!positional.length && !isUpdate) {
     console.log(chalk.bold('\n  Albion Online Price Checker\n'));
-    console.log(`  ${chalk.cyan('albion-prices')} <item name or ID> [quality] [--premium] [--update-cache]\n`);
+    console.log(`  ${chalk.cyan('albion-prices')} <item name or ID> [quality] [--enchant N] [--premium]\n`);
+    console.log(`  ${chalk.cyan('albion-prices scan')} <pattern> [tier] [quality] [--limit N] [--premium]\n`);
     console.log('  Examples:');
-    console.log('    albion-prices "royal bag" 2');
-    console.log('    albion-prices T5_BAG 3 --premium');
-    console.log('    albion-prices "adept\'s sword"');
+    console.log('    albion-prices "expert bag" 1           ' + chalk.dim('# all enchants'));
+    console.log('    albion-prices T5_BAG 2 --enchant 3     ' + chalk.dim('# full city table for .3'));
+    console.log('    albion-prices scan bag 5               ' + chalk.dim('# scan T5 bags, sorted by margin'));
+    console.log('    albion-prices scan sword 6 2 --premium ' + chalk.dim('# T6 swords, quality Good, premium tax'));
     console.log('    albion-prices --update-cache\n');
     console.log('  Quality:  1=Normal  2=Good  3=Outstanding  4=Excellent  5=Masterpiece');
     console.log(chalk.dim('  Tax:      non-premium ~14.5% break-even  ·  --premium ~9.6% break-even\n'));
@@ -230,16 +437,34 @@ async function main() {
 
   let items;
   try {
-    items = await loadItems(update);
+    items = await loadItems(isUpdate);
   } catch (err) {
     console.error(chalk.red('Failed to load item database:'), err.message);
     process.exit(1);
   }
 
-  if (update && !query) {
+  if (isUpdate && positional.length <= 1 && !isScan) {
     console.log(chalk.green('Items cache updated.'));
     process.exit(0);
   }
+
+  // ── Scan mode ──────────────────────────────────────────────────────────────
+  if (isScan) {
+    const [, pattern, tierArg, qualityArg] = positional;
+    if (!pattern) {
+      console.error(chalk.red('\nUsage: albion-prices scan <pattern> [tier] [quality]\n'));
+      process.exit(1);
+    }
+    // Second positional = tier (e.g. 5 → T5_*), third = quality (1-5)
+    const tier    = tierArg ? parseInt(tierArg) : null;
+    const quality = qualityArg ? Math.min(5, Math.max(1, parseInt(qualityArg))) : 1;
+    await runScan(items, pattern, tier, quality, limit, premium);
+    process.exit(0);
+  }
+
+  // ── Single item mode ───────────────────────────────────────────────────────
+  const [query, qualityArg] = positional;
+  const quality = Math.min(5, Math.max(1, parseInt(qualityArg) || 1));
 
   const matches = findItem(items, query);
   if (!matches.length) {
@@ -254,21 +479,19 @@ async function main() {
     console.log(chalk.dim(`\n  Using: ${item.name}  (${item.id})`));
   }
 
+  // Build IDs to fetch (all enchants or specific one)
+  const levels  = enchantFilter !== null ? [enchantFilter] : ENCHANT_LEVELS;
+  const idsToFetch = levels.map(lvl => enchantId(item.id, lvl));
+
   let data;
   try {
-    data = await fetchPrices(item.id, quality);
+    data = await fetchPrices(idsToFetch, quality);
   } catch (err) {
     console.error(chalk.red('\nAPI error:'), err.message);
     process.exit(1);
   }
 
-  printTable(item, quality, data, premium);
-}
-
-async function fetchPrices(itemId, quality) {
-  const url = `${API_BASE}/${itemId}.json?locations=${encodeURIComponent(CITIES.join(','))}&qualities=${quality}`;
-  const res = await axios.get(url, { timeout: 10000 });
-  return res.data;
+  printTable(item, quality, data, premium, enchantFilter);
 }
 
 main().catch(err => {
