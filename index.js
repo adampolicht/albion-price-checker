@@ -43,6 +43,19 @@ function enchantId(baseId, level) {
   return level === 0 ? baseId : `${baseId}@${level}`;
 }
 
+// Parse Albion tier.enchant notation: "6.1" → { tier: 6, enchant: 1 }
+// Plain tier "6" → { tier: 6, enchant: null }. Returns null if invalid.
+function parseTierEnchant(str) {
+  if (!str) return null;
+  const m = str.match(/^(\d+)(?:\.(\d+))?$/);
+  if (!m) return null;
+  const tier    = parseInt(m[1]);
+  const enchant = m[2] !== undefined ? parseInt(m[2]) : null;
+  if (tier < 1 || tier > 8) return null;
+  if (enchant !== null && (enchant < 0 || enchant > 4)) return null;
+  return { tier, enchant };
+}
+
 // ─── Items cache ──────────────────────────────────────────────────────────────
 async function loadItems(forceUpdate) {
   const cacheExists = fs.existsSync(CACHE_FILE);
@@ -63,11 +76,17 @@ async function loadItems(forceUpdate) {
 }
 
 // ─── Fuzzy search ─────────────────────────────────────────────────────────────
-function findItem(items, query) {
+function findItem(items, query, tierFilter = null) {
+  // Direct ID match always checked against full list
   const direct = items.find(i => i.id.toUpperCase() === query.toUpperCase());
   if (direct) return [direct];
 
-  const fuse = new Fuse(items, {
+  // Narrow pool to tier if provided (e.g. tier 6 → only T6_* base items)
+  const pool = tierFilter
+    ? items.filter(i => i.id.toUpperCase().startsWith(`T${tierFilter}_`) && !i.id.includes('@'))
+    : items;
+
+  const fuse = new Fuse(pool, {
     keys: [{ name: 'name', weight: 0.7 }, { name: 'id', weight: 0.3 }],
     includeScore: true,
     threshold: 0.4,
@@ -291,7 +310,7 @@ function printTable(item, quality, data, premium, enchantFilter) {
 }
 
 // ─── Scan mode ────────────────────────────────────────────────────────────────
-async function runScan(items, pattern, tierArg, quality, limit, premium) {
+async function runScan(items, pattern, tierArg, quality, limit, premium, enchantOnly = null) {
   const W   = 92;
   const bar = '═'.repeat(W);
   const sep = '─'.repeat(W);
@@ -313,12 +332,14 @@ async function runScan(items, pattern, tierArg, quality, limit, premium) {
     return;
   }
 
-  // Build full list of IDs (base + enchants)
+  // Build full list of IDs (base + enchants, or specific enchant only)
+  const levelsToFetch = enchantOnly !== null ? [enchantOnly] : ENCHANT_LEVELS;
   const allIds = matched.flatMap(item =>
-    ENCHANT_LEVELS.map(lvl => enchantId(item.id, lvl))
+    levelsToFetch.map(lvl => enchantId(item.id, lvl))
   );
 
-  const tierLabel = tierArg ? ` · Tier ${tierArg}` : '';
+  const enchantLabel = enchantOnly !== null ? ` .${enchantOnly}` : '';
+  const tierLabel = tierArg ? ` · Tier ${tierArg}${enchantLabel}` : '';
   const qualLabel = QUALITY_NAMES[quality] || `Q${quality}`;
   console.log('\n' + chalk.cyan(bar));
   console.log(chalk.bold(`  SCAN  ·  "${pattern}"${tierLabel}  ·  ${qualLabel}  ·  ${matched.length} item type(s)`));
@@ -336,7 +357,7 @@ async function runScan(items, pattern, tierArg, quality, limit, premium) {
   // Calculate best arbitrage per item+enchant
   const rows = [];
   for (const item of matched) {
-    for (const lvl of ENCHANT_LEVELS) {
+    for (const lvl of levelsToFetch) {
       const id      = enchantId(item.id, lvl);
       const cityMap = buildCityMap(data, id, quality);
       const arb     = bestArbitrage(cityMap, premium);
@@ -426,8 +447,10 @@ async function main() {
     console.log(`  ${chalk.cyan('albion-prices scan')} <pattern> [tier] [quality] [--limit N] [--premium]\n`);
     console.log('  Examples:');
     console.log('    albion-prices "expert bag" 1           ' + chalk.dim('# all enchants'));
+    console.log('    albion-prices "carving sword" 6.1      ' + chalk.dim('# T6 .1 enchant, full city table'));
     console.log('    albion-prices T5_BAG 2 --enchant 3     ' + chalk.dim('# full city table for .3'));
     console.log('    albion-prices scan bag 5               ' + chalk.dim('# scan T5 bags, sorted by margin'));
+    console.log('    albion-prices scan sword 6.1           ' + chalk.dim('# T6 swords, .1 enchant only'));
     console.log('    albion-prices scan sword 6 2 --premium ' + chalk.dim('# T6 swords, quality Good, premium tax'));
     console.log('    albion-prices --update-cache\n');
     console.log('  Quality:  1=Normal  2=Good  3=Outstanding  4=Excellent  5=Masterpiece');
@@ -452,21 +475,40 @@ async function main() {
   if (isScan) {
     const [, pattern, tierArg, qualityArg] = positional;
     if (!pattern) {
-      console.error(chalk.red('\nUsage: albion-prices scan <pattern> [tier] [quality]\n'));
+      console.error(chalk.red('\nUsage: albion-prices scan <pattern> [tier[.enchant]] [quality]\n'));
       process.exit(1);
     }
-    // Second positional = tier (e.g. 5 → T5_*), third = quality (1-5)
-    const tier    = tierArg ? parseInt(tierArg) : null;
-    const quality = qualityArg ? Math.min(5, Math.max(1, parseInt(qualityArg))) : 1;
-    await runScan(items, pattern, tier, quality, limit, premium);
+    // tierArg supports plain "6" or tier.enchant "6.1"
+    const parsed      = parseTierEnchant(tierArg);
+    const tier        = parsed?.tier   ?? null;
+    const scanEnchant = parsed?.enchant ?? null;
+    const quality     = qualityArg ? Math.min(5, Math.max(1, parseInt(qualityArg))) : 1;
+    await runScan(items, pattern, tier, quality, limit, premium, scanEnchant);
     process.exit(0);
   }
 
   // ── Single item mode ───────────────────────────────────────────────────────
-  const [query, qualityArg] = positional;
-  const quality = Math.min(5, Math.max(1, parseInt(qualityArg) || 1));
+  const [query, secondArg, thirdArg] = positional;
 
-  const matches = findItem(items, query);
+  // secondArg can be:
+  //   - quality only:      "2"   → quality=2
+  //   - tier.enchant:      "6.1" → tier filter + enchant filter, quality from thirdArg
+  const tierEnchant = parseTierEnchant(secondArg);
+  let quality, tierFilter, enchantFromArg;
+  if (tierEnchant && tierEnchant.tier >= 2 && secondArg?.includes('.')) {
+    // "6.1" style notation
+    tierFilter    = tierEnchant.tier;
+    enchantFromArg = tierEnchant.enchant;
+    quality       = Math.min(5, Math.max(1, parseInt(thirdArg) || 1));
+  } else {
+    tierFilter    = null;
+    enchantFromArg = null;
+    quality       = Math.min(5, Math.max(1, parseInt(secondArg) || 1));
+  }
+  // --enchant flag takes precedence over tier.enchant notation
+  const finalEnchantFilter = enchantFilter !== null ? enchantFilter : enchantFromArg;
+
+  const matches = findItem(items, query, tierFilter);
   if (!matches.length) {
     console.error(chalk.red(`\nNo item found matching: "${query}"\n`));
     process.exit(1);
@@ -480,7 +522,7 @@ async function main() {
   }
 
   // Build IDs to fetch (all enchants or specific one)
-  const levels  = enchantFilter !== null ? [enchantFilter] : ENCHANT_LEVELS;
+  const levels  = finalEnchantFilter !== null ? [finalEnchantFilter] : ENCHANT_LEVELS;
   const idsToFetch = levels.map(lvl => enchantId(item.id, lvl));
 
   let data;
@@ -491,7 +533,7 @@ async function main() {
     process.exit(1);
   }
 
-  printTable(item, quality, data, premium, enchantFilter);
+  printTable(item, quality, data, premium, finalEnchantFilter);
 }
 
 main().catch(err => {
