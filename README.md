@@ -1,6 +1,8 @@
-# Albion Price Checker
+# Albion Online Price Checker & Flip Finder
 
-Terminal tool for checking item prices and finding flip opportunities across all 8 cities in Albion Online. Shows arbitrage routes, profit after tax, and data freshness — all from the command line.
+A command-line tool for **Albion Online** traders. Check live item prices across all 8 cities, find the best city-to-city arbitrage routes, and rank flip opportunities by silver profit — directly from your terminal.
+
+Built for players who want to identify market inefficiencies fast: buy low in one city, sell high in another, with profit calculated after market tax. Supports all tiers (T4–T8), enchantment levels (.1–.4), and quality grades.
 
 ## Installation
 
