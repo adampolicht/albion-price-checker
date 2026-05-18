@@ -586,7 +586,7 @@ async function main() {
   const isFlips    = positional[0] === 'flips';
   const isUpdate   = flags.has('--update-cache');
   const premium    = flags.has('--premium');
-  const skipCities = flags.has('--skip-caerleon') ? ['Caerleon'] : [];
+  const skipCities = flags.has('--skip-blackmarket') ? ['Black Market'] : [];
 
   // --enchant N flag
   let enchantFilter = null;
@@ -601,8 +601,8 @@ async function main() {
   if (!positional.length && !isUpdate) {
     console.log(chalk.bold('\n  Albion Online Price Checker\n'));
     console.log(`  ${chalk.cyan('albion-prices')} <item name or ID> [quality] [--enchant N] [--premium]\n`);
-    console.log(`  ${chalk.cyan('albion-prices scan')} <pattern> [tier] [quality] [--limit N] [--premium] [--skip-caerleon]\n`);
-    console.log(`  ${chalk.cyan('albion-prices flips')} [pattern] [tier] [quality] [--limit N] [--premium] [--skip-caerleon]\n`);
+    console.log(`  ${chalk.cyan('albion-prices scan')} <pattern> [tier] [quality] [--limit N] [--premium] [--skip-blackmarket]\n`);
+    console.log(`  ${chalk.cyan('albion-prices flips')} [pattern] [tier] [quality] [--limit N] [--premium] [--skip-blackmarket]\n`);
     console.log('  Examples:');
     console.log('    albion-prices "expert bag" 1                    ' + chalk.dim('# all enchants'));
     console.log('    albion-prices "carving sword" 6.1               ' + chalk.dim('# T6 .1 enchant, full city table'));
@@ -611,8 +611,8 @@ async function main() {
     console.log('    albion-prices scan sword 6.1                    ' + chalk.dim('# T6 swords, .1 enchant only'));
     console.log('    albion-prices flips                             ' + chalk.dim('# best flips across popular T4–T8 items'));
     console.log('    albion-prices flips bag 5                       ' + chalk.dim('# best bag flips, T5'));
-    console.log('    albion-prices flips --skip-caerleon             ' + chalk.dim('# exclude Caerleon from results'));
-    console.log('    albion-prices flips --skip-caerleon --limit 5   ' + chalk.dim('# top 5, no Caerleon'));
+    console.log('    albion-prices flips --skip-blackmarket             ' + chalk.dim('# exclude Caerleon from results'));
+    console.log('    albion-prices flips --skip-blackmarket --limit 5   ' + chalk.dim('# top 5, no Caerleon'));
     console.log('    albion-prices --update-cache\n');
     console.log('  Quality:  1=Normal  2=Good  3=Outstanding  4=Excellent  5=Masterpiece');
     console.log(chalk.dim('  Tax:      non-premium ~14.5% break-even  ·  --premium ~9.6% break-even\n'));
