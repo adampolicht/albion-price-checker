@@ -21,6 +21,17 @@ const QUALITY_NAMES = { 1: 'Normal', 2: 'Good', 3: 'Outstanding', 4: 'Excellent'
 const ENCHANT_LEVELS  = [0, 1, 2, 3, 4];
 const BATCH_SIZE      = 80;   // items per API request
 
+// Keywords used for broad "flips" scan when no pattern is given (T4–T8 popular tradeable items)
+const FLIP_KEYWORDS = [
+  'bag', 'cape', 'tome', 'shield',
+  'sword', 'axe', 'bow', 'crossbow', 'staff', 'spear',
+  'mace', 'hammer', 'dagger', 'quarterstaff', 'warbow',
+  'plate armor', 'leather armor', 'cloth armor',
+  'plate shoes', 'leather shoes', 'cloth shoes',
+  'plate helmet', 'leather helmet', 'cloth helmet',
+  'plate gloves', 'leather gloves', 'cloth gloves',
+];
+
 // Staleness thresholds (minutes)
 const STALE_WARN_MIN  = 45;   // yellow warning
 const STALE_OLD_MIN   = 180;  // red — likely gone
@@ -130,9 +141,10 @@ function buildCityMap(data, itemId, quality) {
   return map;
 }
 
-function bestArbitrage(cityMap, premium) {
-  const withSell = CITIES.filter(c => cityMap[c]?.sell > 0);
-  const withBuy  = CITIES.filter(c => cityMap[c]?.buy  > 0);
+function bestArbitrage(cityMap, premium, skipCities = []) {
+  const active   = skipCities.length ? CITIES.filter(c => !skipCities.includes(c)) : CITIES;
+  const withSell = active.filter(c => cityMap[c]?.sell > 0);
+  const withBuy  = active.filter(c => cityMap[c]?.buy  > 0);
 
   let best = null;
   for (const buyCity of withSell) {
@@ -310,7 +322,7 @@ function printTable(item, quality, data, premium, enchantFilter) {
 }
 
 // ─── Scan mode ────────────────────────────────────────────────────────────────
-async function runScan(items, pattern, tierArg, quality, limit, premium, enchantOnly = null) {
+async function runScan(items, pattern, tierArg, quality, limit, premium, enchantOnly = null, skipCities = []) {
   const W   = 92;
   const bar = '═'.repeat(W);
   const sep = '─'.repeat(W);
@@ -360,7 +372,7 @@ async function runScan(items, pattern, tierArg, quality, limit, premium, enchant
     for (const lvl of levelsToFetch) {
       const id      = enchantId(item.id, lvl);
       const cityMap = buildCityMap(data, id, quality);
-      const arb     = bestArbitrage(cityMap, premium);
+      const arb     = bestArbitrage(cityMap, premium, skipCities);
       if (!arb || arb.profit === null) continue;
       rows.push({ item, lvl, arb });
     }
@@ -421,15 +433,160 @@ async function runScan(items, pattern, tierArg, quality, limit, premium, enchant
   console.log('\n' + chalk.cyan(bar) + '\n');
 }
 
+// ─── Flips mode ───────────────────────────────────────────────────────────────
+async function runFlips(items, pattern, tierArg, quality, limit, premium, skipCities, enchantOnly = null) {
+  const W   = 96;
+  const bar = '═'.repeat(W);
+  const sep = '─'.repeat(W);
+
+  // Filter items: either by user pattern or by popular-tradeable keywords in T4–T8
+  const tierPrefix = tierArg ? `T${tierArg}_` : null;
+
+  let matched;
+  if (pattern) {
+    const patWords = pattern.toLowerCase().split(/\s+/);
+    matched = items.filter(item => {
+      if (item.id.includes('@')) return false;
+      if (tierPrefix && !item.id.toUpperCase().startsWith(tierPrefix)) return false;
+      const nameLower = item.name.toLowerCase();
+      const idLower   = item.id.toLowerCase();
+      return patWords.every(w => nameLower.includes(w) || idLower.includes(w));
+    });
+  } else {
+    matched = items.filter(item => {
+      if (item.id.includes('@')) return false;
+      if (tierPrefix) {
+        if (!item.id.toUpperCase().startsWith(tierPrefix)) return false;
+      } else {
+        const m = item.id.match(/^T(\d+)_/);
+        if (!m) return false;
+        const t = parseInt(m[1]);
+        if (t < 4 || t > 8) return false;
+      }
+      const nameLower = item.name.toLowerCase();
+      return FLIP_KEYWORDS.some(kw => nameLower.includes(kw));
+    });
+  }
+
+  if (!matched.length) {
+    console.log(chalk.red('\nNo items matched the criteria.\n'));
+    return;
+  }
+
+  const levelsToFetch = enchantOnly !== null ? [enchantOnly] : ENCHANT_LEVELS;
+  const allIds = matched.flatMap(item => levelsToFetch.map(lvl => enchantId(item.id, lvl)));
+
+  const skipLabel  = skipCities.length ? chalk.yellow(`  ·  skip: ${skipCities.join(', ')}`) : '';
+  const tierLabel  = tierArg ? ` · T${tierArg}` : ' · T4–T8';
+  const patLabel   = pattern ? ` · "${pattern}"` : ' · popular items';
+  const qualLabel  = QUALITY_NAMES[quality] || `Q${quality}`;
+
+  console.log('\n' + chalk.cyan(bar));
+  console.log(chalk.bold(`  BEST FLIPS${patLabel}${tierLabel}  ·  ${qualLabel}`) + skipLabel);
+  console.log(chalk.dim(`  Scanning ${matched.length} item types (${allIds.length} variants)...`));
+  console.log(chalk.cyan(bar));
+
+  let data;
+  try {
+    data = await fetchPrices(allIds, quality);
+  } catch (err) {
+    console.error(chalk.red('API error:'), err.message);
+    return;
+  }
+
+  // Collect all profitable flips
+  const rows = [];
+  for (const item of matched) {
+    for (const lvl of levelsToFetch) {
+      const id      = enchantId(item.id, lvl);
+      const cityMap = buildCityMap(data, id, quality);
+      const arb     = bestArbitrage(cityMap, premium, skipCities);
+      if (!arb || arb.profit === null || arb.profit <= 0) continue;
+      rows.push({ item, lvl, arb });
+    }
+  }
+
+  if (!rows.length) {
+    console.log(chalk.dim('  No profitable flips found right now.\n'));
+    return;
+  }
+
+  // Sort by absolute profit (silver earned per flip), not %, to surface real opportunities
+  rows.sort((a, b) => (b.arb.profit ?? -Infinity) - (a.arb.profit ?? -Infinity));
+  const display = rows.slice(0, limit);
+
+  console.log(chalk.bold(
+    '  ' + '#'.padEnd(4) +
+    'Item'.padEnd(26) + 'Ench'.padEnd(6) +
+    'Buy in'.padEnd(14) + 'Buy Price'.padStart(10) +
+    '  ' + 'Sell in'.padEnd(14) + 'Sell Price'.padStart(11) +
+    '  Profit      Margin  Data'
+  ));
+  console.log(chalk.dim('  ' + sep));
+
+  for (let i = 0; i < display.length; i++) {
+    const { item, lvl, arb } = display[i];
+    const enchLabel = lvl === 0 ? 'base' : `.${lvl}  `;
+
+    const profitStr = chalk.green(`+${fmtSilver(Math.round(arb.profit)).trim()}`);
+    const marginStr = arb.profitPct !== null
+      ? chalk.green(`${arb.profitPct.toFixed(0)}%`.padStart(5))
+      : '    —';
+
+    const buyMins  = ageMinutes(arb.buyAge);
+    const sellMins = ageMinutes(arb.sellAge);
+    const maxMins  = Math.max(buyMins === Infinity ? 0 : buyMins, sellMins === Infinity ? 0 : sellMins);
+    const fresh = maxMins < STALE_WARN_MIN ? chalk.green('✓ fresh')
+                : maxMins < STALE_OLD_MIN  ? chalk.yellow('~ aging')
+                : chalk.red('✗ stale');
+
+    const medal = i === 0 ? chalk.yellow('🥇') : i === 1 ? chalk.white('🥈') : i === 2 ? chalk.yellow('🥉') : '  ';
+    const rankStr = `${medal} ${String(i + 1) + '.'}`.padEnd(6);
+
+    console.log(
+      '  ' + rankStr +
+      item.name.slice(0, 24).padEnd(26) +
+      enchLabel.padEnd(6) +
+      arb.buyCity.padEnd(14) +
+      fmtSilver(arb.buyPrice).padStart(10) +
+      '  ' + arb.sellCity.padEnd(14) +
+      fmtSilver(arb.sellPrice).padStart(11) +
+      '  ' + profitStr.padEnd(14) +
+      marginStr + '  ' + fresh
+    );
+  }
+
+  console.log(chalk.dim('  ' + sep));
+  if (rows.length > limit) {
+    console.log(chalk.dim(`  Showing top ${limit} of ${rows.length} profitable flips.  Use --limit N to see more.`));
+  }
+  console.log(chalk.dim(
+    `  Sorted by profit  ·  Tax: ${premium ? 'premium 4%' : 'non-premium 8%'}  ·  ` +
+    `✓ fresh <${STALE_WARN_MIN}min  ~ aging <${STALE_OLD_MIN}min  ✗ stale`
+  ));
+  if (skipCities.length) {
+    console.log(chalk.dim(`  ${chalk.yellow('⚠')}  Excluded from results: ${skipCities.join(', ')}`));
+  }
+  console.log('\n' + chalk.cyan(bar) + '\n');
+}
+
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 async function main() {
   const argv       = process.argv.slice(2);
   const flags      = new Set(argv.filter(a => a.startsWith('--')));
-  const positional = argv.filter(a => !a.startsWith('--'));
+  // Exclude values consumed by value-taking flags (e.g. the "3" in --limit 3)
+  const VALUE_FLAGS = new Set(['--enchant', '--limit']);
+  const positional = argv.filter((a, i) => {
+    if (a.startsWith('--')) return false;
+    if (i > 0 && VALUE_FLAGS.has(argv[i - 1])) return false;
+    return true;
+  });
 
   const isScan     = positional[0] === 'scan';
+  const isFlips    = positional[0] === 'flips';
   const isUpdate   = flags.has('--update-cache');
   const premium    = flags.has('--premium');
+  const skipCities = flags.has('--skip-caerleon') ? ['Caerleon'] : [];
 
   // --enchant N flag
   let enchantFilter = null;
@@ -444,14 +601,18 @@ async function main() {
   if (!positional.length && !isUpdate) {
     console.log(chalk.bold('\n  Albion Online Price Checker\n'));
     console.log(`  ${chalk.cyan('albion-prices')} <item name or ID> [quality] [--enchant N] [--premium]\n`);
-    console.log(`  ${chalk.cyan('albion-prices scan')} <pattern> [tier] [quality] [--limit N] [--premium]\n`);
+    console.log(`  ${chalk.cyan('albion-prices scan')} <pattern> [tier] [quality] [--limit N] [--premium] [--skip-caerleon]\n`);
+    console.log(`  ${chalk.cyan('albion-prices flips')} [pattern] [tier] [quality] [--limit N] [--premium] [--skip-caerleon]\n`);
     console.log('  Examples:');
-    console.log('    albion-prices "expert bag" 1           ' + chalk.dim('# all enchants'));
-    console.log('    albion-prices "carving sword" 6.1      ' + chalk.dim('# T6 .1 enchant, full city table'));
-    console.log('    albion-prices T5_BAG 2 --enchant 3     ' + chalk.dim('# full city table for .3'));
-    console.log('    albion-prices scan bag 5               ' + chalk.dim('# scan T5 bags, sorted by margin'));
-    console.log('    albion-prices scan sword 6.1           ' + chalk.dim('# T6 swords, .1 enchant only'));
-    console.log('    albion-prices scan sword 6 2 --premium ' + chalk.dim('# T6 swords, quality Good, premium tax'));
+    console.log('    albion-prices "expert bag" 1                    ' + chalk.dim('# all enchants'));
+    console.log('    albion-prices "carving sword" 6.1               ' + chalk.dim('# T6 .1 enchant, full city table'));
+    console.log('    albion-prices T5_BAG 2 --enchant 3              ' + chalk.dim('# full city table for .3'));
+    console.log('    albion-prices scan bag 5                        ' + chalk.dim('# scan T5 bags, sorted by margin'));
+    console.log('    albion-prices scan sword 6.1                    ' + chalk.dim('# T6 swords, .1 enchant only'));
+    console.log('    albion-prices flips                             ' + chalk.dim('# best flips across popular T4–T8 items'));
+    console.log('    albion-prices flips bag 5                       ' + chalk.dim('# best bag flips, T5'));
+    console.log('    albion-prices flips --skip-caerleon             ' + chalk.dim('# exclude Caerleon from results'));
+    console.log('    albion-prices flips --skip-caerleon --limit 5   ' + chalk.dim('# top 5, no Caerleon'));
     console.log('    albion-prices --update-cache\n');
     console.log('  Quality:  1=Normal  2=Good  3=Outstanding  4=Excellent  5=Masterpiece');
     console.log(chalk.dim('  Tax:      non-premium ~14.5% break-even  ·  --premium ~9.6% break-even\n'));
@@ -471,6 +632,30 @@ async function main() {
     process.exit(0);
   }
 
+  // ── Flips mode ─────────────────────────────────────────────────────────────
+  if (isFlips) {
+    // flips [pattern] [tier[.enchant]] [quality]
+    // pattern is optional — if first arg looks like a tier ("5", "6.1") treat it as tier
+    const args = positional.slice(1);  // drop "flips"
+    let pattern = null, tierArg = null, qualityArg = null, flipsEnchant = null;
+
+    for (const a of args) {
+      const parsed = parseTierEnchant(a);
+      if (parsed && !pattern) {
+        // looks like a tier spec
+        tierArg      = parsed.tier;
+        flipsEnchant = parsed.enchant;
+      } else if (/^\d$/.test(a) && parseInt(a) >= 1 && parseInt(a) <= 5 && tierArg !== null) {
+        qualityArg = parseInt(a);
+      } else if (!pattern) {
+        pattern = a;
+      }
+    }
+    const quality = qualityArg ? Math.min(5, Math.max(1, qualityArg)) : 1;
+    await runFlips(items, pattern, tierArg ? String(tierArg) : null, quality, limit, premium, skipCities, flipsEnchant);
+    process.exit(0);
+  }
+
   // ── Scan mode ──────────────────────────────────────────────────────────────
   if (isScan) {
     const [, pattern, tierArg, qualityArg] = positional;
@@ -483,7 +668,7 @@ async function main() {
     const tier        = parsed?.tier   ?? null;
     const scanEnchant = parsed?.enchant ?? null;
     const quality     = qualityArg ? Math.min(5, Math.max(1, parseInt(qualityArg))) : 1;
-    await runScan(items, pattern, tier, quality, limit, premium, scanEnchant);
+    await runScan(items, pattern, tier, quality, limit, premium, scanEnchant, skipCities);
     process.exit(0);
   }
 
